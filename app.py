@@ -1,17 +1,19 @@
 import os
 import io
-import json
-import sqlite3
-import datetime
 import streamlit as st
 from groq import Groq
 from dotenv import load_dotenv
+from supabase import create_client, Client
 import pypdf
 import docx
 
-# ── Load API key ──────────────────────────────────────────────────────────────
+# ── Load credentials ──────────────────────────────────────────────────────────
 load_dotenv()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+supabase: Client = create_client(
+    os.getenv("SUPABASE_URL"),
+    os.getenv("SUPABASE_KEY")
+)
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are an expert UK legal assistant specialising in
@@ -75,92 +77,50 @@ LEGAL_AREAS = {
 
 # ── Database functions ────────────────────────────────────────────────────────
 
-def init_db():
-    """Create the database and tables if they don't exist."""
-    conn = sqlite3.connect("conversations.db")
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS conversations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            conversation_id INTEGER NOT NULL,
-            role TEXT NOT NULL,
-            content TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (conversation_id) REFERENCES conversations(id)
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-
 def create_conversation(title):
     """Create a new conversation and return its ID."""
-    conn = sqlite3.connect("conversations.db")
-    c = conn.cursor()
-    c.execute("INSERT INTO conversations (title) VALUES (?)", (title,))
-    conv_id = c.lastrowid
-    conn.commit()
-    conn.close()
-    return conv_id
+    result = supabase.table("conversations").insert({"title": title}).execute()
+    return result.data[0]["id"]
 
 
 def get_all_conversations():
     """Get all conversations ordered by most recent first."""
-    conn = sqlite3.connect("conversations.db")
-    c = conn.cursor()
-    c.execute("SELECT id, title, updated_at FROM conversations ORDER BY updated_at DESC")
-    conversations = c.fetchall()
-    conn.close()
-    return conversations
+    result = supabase.table("conversations")\
+        .select("id, title, updated_at")\
+        .order("updated_at", desc=True)\
+        .execute()
+    return result.data
 
 
 def get_messages(conversation_id):
     """Get all messages for a conversation."""
-    conn = sqlite3.connect("conversations.db")
-    c = conn.cursor()
-    c.execute("SELECT role, content FROM messages WHERE conversation_id=? ORDER BY created_at", (conversation_id,))
-    messages = c.fetchall()
-    conn.close()
-    return [{"role": row[0], "content": row[1]} for row in messages]
+    result = supabase.table("messages")\
+        .select("role, content")\
+        .eq("conversation_id", conversation_id)\
+        .order("created_at")\
+        .execute()
+    return [{"role": row["role"], "content": row["content"]} for row in result.data]
 
 
 def save_message(conversation_id, role, content):
-    """Save a message to the database."""
-    conn = sqlite3.connect("conversations.db")
-    c = conn.cursor()
-    c.execute("INSERT INTO messages (conversation_id, role, content) VALUES (?, ?, ?)",
-              (conversation_id, role, content))
-    c.execute("UPDATE conversations SET updated_at=CURRENT_TIMESTAMP WHERE id=?",
-              (conversation_id,))
-    conn.commit()
-    conn.close()
-
-
-def update_conversation_title(conversation_id, title):
-    """Update the title of a conversation."""
-    conn = sqlite3.connect("conversations.db")
-    c = conn.cursor()
-    c.execute("UPDATE conversations SET title=? WHERE id=?", (title, conversation_id))
-    conn.commit()
-    conn.close()
+    """Save a message and update conversation timestamp."""
+    supabase.table("messages").insert({
+        "conversation_id": conversation_id,
+        "role": role,
+        "content": content
+    }).execute()
+    supabase.table("conversations")\
+        .update({"updated_at": "now()"})\
+        .eq("id", conversation_id)\
+        .execute()
 
 
 def delete_conversation(conversation_id):
-    """Delete a conversation and all its messages."""
-    conn = sqlite3.connect("conversations.db")
-    c = conn.cursor()
-    c.execute("DELETE FROM messages WHERE conversation_id=?", (conversation_id,))
-    c.execute("DELETE FROM conversations WHERE id=?", (conversation_id,))
-    conn.commit()
-    conn.close()
+    """Delete a conversation — messages deleted automatically via CASCADE."""
+    supabase.table("conversations")\
+        .delete()\
+        .eq("id", conversation_id)\
+        .execute()
 
 
 def generate_title(first_message):
@@ -222,9 +182,6 @@ Quote directly from the document to support your answers."""
     return response.choices[0].message.content
 
 
-# ── Initialise ────────────────────────────────────────────────────────────────
-init_db()
-
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="UK Legal Assistant",
@@ -251,12 +208,6 @@ st.markdown("""
         font-size: 13px;
         color: #000000 !important;
     }
-    .conv-item {
-        padding: 8px 12px;
-        border-radius: 8px;
-        margin-bottom: 4px;
-        cursor: pointer;
-    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -276,7 +227,8 @@ with st.sidebar:
     st.markdown("---")
 
     # New conversation button
-    if st.button("✏️ New conversation", use_container_width=True, type="primary"):
+    if st.button("✏️ New conversation",
+                 use_container_width=True, type="primary"):
         st.session_state.current_conv_id = None
         st.session_state.messages = []
         st.session_state.document_text = ""
@@ -291,20 +243,17 @@ with st.sidebar:
     if not conversations:
         st.caption("No conversations yet. Start chatting!")
     else:
-        for conv_id, title, updated_at in conversations:
+        for conv in conversations:
+            conv_id = conv["id"]
+            title = conv["title"]
             col_a, col_b = st.columns([5, 1])
             with col_a:
-                # Highlight current conversation
-                if conv_id == st.session_state.current_conv_id:
-                    if st.button(f"💬 {title}", key=f"conv_{conv_id}",
-                                use_container_width=True, type="primary"):
-                        pass
-                else:
-                    if st.button(f"💬 {title}", key=f"conv_{conv_id}",
-                                use_container_width=True):
-                        st.session_state.current_conv_id = conv_id
-                        st.session_state.messages = get_messages(conv_id)
-                        st.rerun()
+                btn_type = "primary" if conv_id == st.session_state.current_conv_id else "secondary"
+                if st.button(f"💬 {title}", key=f"conv_{conv_id}",
+                            use_container_width=True, type=btn_type):
+                    st.session_state.current_conv_id = conv_id
+                    st.session_state.messages = get_messages(conv_id)
+                    st.rerun()
             with col_b:
                 if st.button("🗑", key=f"del_{conv_id}"):
                     delete_conversation(conv_id)
@@ -315,7 +264,7 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # Document upload in sidebar
+    # Document upload
     st.markdown("### 📄 Upload Document")
     uploaded_file = st.file_uploader(
         "PDF, Word, or Text file",
@@ -348,8 +297,6 @@ with st.sidebar:
                     st.session_state.clicked_question = question
 
 # ── MAIN AREA ─────────────────────────────────────────────────────────────────
-
-# Header
 st.markdown("""
 <div class="main-header">
     <h1>⚖️ UK Legal Assistant</h1>
@@ -357,7 +304,6 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# Disclaimer
 st.markdown("""
 <div class="disclaimer-box">
     ⚠️ <strong>Important:</strong> This tool provides general legal information only,
@@ -367,7 +313,6 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# Document status
 if st.session_state.document_text:
     st.info("📄 Document loaded — answers will be based on your specific document")
 
@@ -381,14 +326,12 @@ if st.session_state.clicked_question:
     prompt = st.session_state.clicked_question
     st.session_state.clicked_question = ""
 
-    # Create new conversation if needed
     if st.session_state.current_conv_id is None:
         title = generate_title(prompt)
         st.session_state.current_conv_id = create_conversation(title)
 
     with st.chat_message("user"):
         st.markdown(prompt)
-
     st.session_state.messages.append({"role": "user", "content": prompt})
     save_message(st.session_state.current_conv_id, "user", prompt)
 
@@ -399,7 +342,6 @@ if st.session_state.clicked_question:
                 st.session_state.document_text
             )
             st.markdown(answer)
-
     st.session_state.messages.append({"role": "assistant", "content": answer})
     save_message(st.session_state.current_conv_id, "assistant", answer)
     st.rerun()
@@ -407,14 +349,12 @@ if st.session_state.clicked_question:
 # Chat input
 if prompt := st.chat_input("Ask your legal question here..."):
 
-    # Create new conversation if needed
     if st.session_state.current_conv_id is None:
         title = generate_title(prompt)
         st.session_state.current_conv_id = create_conversation(title)
 
     with st.chat_message("user"):
         st.markdown(prompt)
-
     st.session_state.messages.append({"role": "user", "content": prompt})
     save_message(st.session_state.current_conv_id, "user", prompt)
 
@@ -425,6 +365,5 @@ if prompt := st.chat_input("Ask your legal question here..."):
                 st.session_state.document_text
             )
             st.markdown(answer)
-
     st.session_state.messages.append({"role": "assistant", "content": answer})
     save_message(st.session_state.current_conv_id, "assistant", answer)
